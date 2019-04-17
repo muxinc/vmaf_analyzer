@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
+	"os/exec"
 
 	"github.com/grafov/m3u8"
 )
@@ -14,6 +18,58 @@ var (
 	model     = flag.String("model", "vmaf_v0.6.1.pkl", "vmaf model to use")
 	dataFile  = flag.String("datafile", "data.json", "Location of the data file to use for processing")
 )
+
+// DataFile represents the current environment data
+// Resolutions are represented by *widths* in 16-pixel buckets
+// Bandwidths are represented by *kbps* in 100Kbps buckets
+type DataFile struct {
+	ResolutionPcts []float64 `json:"resolution_pcts"`
+	BandwidthPcts  []float64 `json:"bandwidth_pcts"`
+}
+
+type FFProbeOutput struct {
+	Streams []*FFProbeStream `json:"streams"`
+}
+
+type FFProbeStream struct {
+	Width  uint64 `json:"width"`
+	Height uint64 `json:"height"`
+}
+
+const resolutionsLen = 120
+const bandwidthsLen = 100
+
+func sumFloat64Array(in []float64) float64 {
+	result := float64(0.0)
+	for _, val := range in {
+		result += val
+	}
+	return result
+}
+
+func probeFile(filename string) (*FFProbeOutput, error) {
+	probecmd := exec.Command("ffprobe", "-print_format", "json", "-show_streams", "-select_streams", "v:0", filename)
+	stdoutData, err := probecmd.Output()
+	fmt.Printf("Probe output: %s\n", string(stdoutData))
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("Error running probe: %s", exitErr.Stderr)
+		}
+		return nil, fmt.Errorf("Unexpected error running probe: %v", err)
+	}
+
+	var probe FFProbeOutput
+	err = json.Unmarshal(stdoutData, &probe)
+	if err != nil {
+		fmt.Printf("Failed to unmarshal probe response: '%v'\n", err)
+		return nil, fmt.Errorf("Failed to unmarshal probe response: '%v'", err)
+	}
+	return &probe, nil
+}
+
+func WidthToHeight(width, mezzanineWidth, mezzanineHeight uint64) uint64 {
+	return 0
+}
 
 func main() {
 	flag.Parse()
@@ -57,6 +113,54 @@ func main() {
 	for _, variant := range masterPlaylist.Variants {
 		fmt.Printf("Here's a variant: %v\n", variant)
 	}
+
+	fmt.Printf("Input has %d variants\n", len(masterPlaylist.Variants))
+
+	fileReader, err := os.Open(*dataFile)
+	if err != nil {
+		fmt.Printf("Failed to load data file: %v", err)
+		return
+	}
+	defer fileReader.Close()
+
+	rawFile, err := ioutil.ReadAll(fileReader)
+	if err != nil {
+		fmt.Printf("Failed to read data file: %v", err)
+		return
+	}
+
+	var data DataFile
+	if err := json.Unmarshal(rawFile, &data); err != nil {
+		fmt.Printf("Failed to unmarshal data: %v", err)
+		return
+	}
+
+	if len(data.BandwidthPcts) != bandwidthsLen {
+		fmt.Printf("Invalid input data; expected %d bandwidth entries but got %d\n", bandwidthsLen, len(data.BandwidthPcts))
+		return
+	}
+
+	fmt.Printf("Bandwidths len: %d sum: %f\n", len(data.BandwidthPcts), sumFloat64Array(data.BandwidthPcts))
+	fmt.Printf("Resolutions len: %d sum: %f\n", len(data.ResolutionPcts), sumFloat64Array(data.ResolutionPcts))
+
+	fileInfo, err := probeFile(mezzanineFile)
+	if err != nil {
+		fmt.Printf("Failed to probe file: %v\n", err)
+		return
+	}
+
+	if len(fileInfo.Streams) != 1 {
+		fmt.Printf("Input file must have exactly 1 video stream, but had %d streams\n", len(fileInfo.Streams))
+		return
+	}
+
+	videoStream := fileInfo.Streams[0]
+	if videoStream.Width == 0 || videoStream.Height == 0 {
+		fmt.Printf("Input file must have a valid width and height, but has %dx%d", videoStream.Width, videoStream.Height)
+		return
+	}
+
+	fmt.Printf("Input widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
 
 	// Parse bitrate & resolution combinations
 
