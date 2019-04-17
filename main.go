@@ -24,6 +24,7 @@ const (
 	distortedDecodePath = "/tmp/distorted.yuv"
 	logsDir             = "logs"
 	minVmafResolution   = 192
+	lowVMAFThreshold    = 5.0
 )
 
 var (
@@ -106,8 +107,8 @@ func sumFloat64Array(in []float64) float64 {
 func probeFile(filename string) (*FFProbeOutput, error) {
 	probecmd := exec.Command("ffprobe", "-print_format", "json", "-show_streams", "-show_frames", "-select_streams", "v:0", filename)
 	stdoutData, err := probecmd.Output()
-	fmt.Printf("Probe output: %s\n", string(stdoutData))
 	if err != nil {
+		fmt.Printf("Probe output: %s\n", string(stdoutData))
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("Error running probe: %s", exitErr.Stderr)
 		}
@@ -127,8 +128,8 @@ func probeFile(filename string) (*FFProbeOutput, error) {
 func DumpStream(variantUrl string, outputName string) (*FFProbeOutput, error) {
 	dumpCmd := exec.Command("ffmpeg", "-y", "-i", variantUrl, "-c", "copy", outputName)
 	stdoutData, err := dumpCmd.Output()
-	fmt.Printf("Dump output: %s\n", string(stdoutData))
 	if err != nil {
+		fmt.Printf("Dump output: %s\n", string(stdoutData))
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("Error running ffmpeg dump: %s", exitErr.Stderr)
 		}
@@ -218,6 +219,7 @@ func main() {
 	manifestURL := flag.Args()[1]
 
 	// Probe the input file
+	fmt.Printf("Probing mezzanine file %q\n", mezzanineFile)
 	mezzanineInfo, err := probeFile(mezzanineFile)
 	if err != nil {
 		fmt.Printf("Failed to probe file: %v\n", err)
@@ -235,9 +237,10 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Input widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
+	fmt.Printf("Mezzanine widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
 
 	// Load the master manfest
+	fmt.Printf("Retrieving master manifest from URI %q\n", manifestURL)
 	resp, err := http.Get(manifestURL)
 	if err != nil {
 		fmt.Printf("Failed to fetch master manfiest (%s): %v\n", manifestURL, err)
@@ -260,16 +263,14 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Master Playlist: %+v\n", masterPlaylist)
-	fmt.Printf("Loading mezzanine: %s\n", mezzanineFile)
-
 	sortedVariants := masterPlaylist.Variants
 	sort.Sort(ByBandwidth(masterPlaylist.Variants))
 
+	fmt.Printf("Input has %d variants\n", len(sortedVariants))
+
 	variantInfo := make([]*FFProbeOutput, len(sortedVariants))
 	for i, variant := range sortedVariants {
-		fmt.Printf("Here's a variant: %v\n", variant)
-
+		fmt.Printf("Dumping variant %d\n", i)
 		if variantInfo[i], err = DumpStream(variant.URI, fmt.Sprintf("variant_%d.ts", i)); err != nil {
 			fmt.Printf("Failed to dump stream: %v\n", err)
 			return
@@ -287,8 +288,6 @@ func main() {
 
 		fmt.Printf("Variant info looks good: %d\n", i)
 	}
-
-	fmt.Printf("Input has %d variants\n", len(sortedVariants))
 
 	fileReader, err := os.Open(*dataFile)
 	if err != nil {
@@ -334,7 +333,11 @@ func main() {
 	}
 
 	for i, totalPct := range userPcts {
-		fmt.Printf("%0.3f of users have sufficient bandwidth for rendition %d\n", totalPct, i)
+		if i == 0 {
+			fmt.Printf("%0.3f of users have insufficient bandwidth for *any* rendition to play smoothly\n", totalPct)
+		} else {
+			fmt.Printf("%0.3f of users have sufficient bandwidth for rendition %d\n", totalPct, i)
+		}
 	}
 
 	fmt.Printf("Preparing for VMAF\n")
@@ -346,7 +349,11 @@ func main() {
 	effectiveVmafs := make([][]float64, len(sortedVariants))
 	for i := range sortedVariants {
 		effectiveVmafs[i] = make([]float64, len(data.ResolutionPcts))
-		for j, _ := range data.ResolutionPcts {
+		if i == 0 {
+			continue
+		}
+
+		for j, resUserPct := range data.ResolutionPcts {
 			ctx, cancelFunc := context.WithCancel(context.Background())
 			curWidth := uint64((j + 1) * 16)
 			curHeight := WidthToHeight(curWidth, videoStream.Width, videoStream.Height)
@@ -354,6 +361,9 @@ func main() {
 			if curWidth < minVmafResolution || curHeight < minVmafResolution {
 				fmt.Printf("Skipping resolution %dx%d - its too small for VMAF\n", curWidth, curHeight)
 				continue
+			}
+			if resUserPct == 0.0 {
+				fmt.Printf("Skipping resolution %dx%d - zero percentage of users watch at this resolution", curWidth, curHeight)
 			}
 
 			fmt.Printf("Calculating VMAF score at %dx%d\n", curWidth, curHeight)
@@ -386,6 +396,8 @@ func main() {
 				if vmafErr != nil {
 					fmt.Printf("Error encountered calculating vmaf:\n%v\n", vmafErr)
 					errc <- err
+				} else if vmafScore < lowVMAFThreshold {
+					errc <- fmt.Errorf("Low vmaf score detected, most likely due to misconfiguration. Score %f is below threshold %f\n", vmafScore, lowVMAFThreshold)
 				} else {
 					fmt.Printf("I calculated vmaf and got this harmonic mean: %f\n", vmafScore)
 				}
@@ -404,6 +416,7 @@ func main() {
 				if err != nil && !hadErr {
 					hadErr = true
 					cancelFunc()
+					fmt.Printf("Error encountered running VMAF: %v\n", err)
 				}
 			}
 
@@ -413,9 +426,20 @@ func main() {
 			}
 
 			fmt.Println("Oh yeah decode done\n")
-			return
+
+			effectiveVmafs[i][j] = vmafScore
+
+			fmt.Printf("%f%% of users have the bitrate to watch this rendition\n", userPcts[i])
+			fmt.Printf("Of those, %f%% will be watching at the current resolution of %dx%d\n", resUserPct, curWidth, curHeight)
 		}
 	}
 
-	fmt.Println("Done")
+	totalVmaf := float64(0.0)
+	for i, bitratePct := range userPcts {
+		for j, resPct := range data.ResolutionPcts {
+			totalVmaf += effectiveVmafs[i][j] * bitratePct * resPct
+		}
+	}
+
+	fmt.Printf("Average VMAF: %f\n", totalVmaf)
 }
