@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/grafov/m3u8"
+	"gonum.org/v1/gonum/stat"
 )
 
 const (
@@ -21,13 +22,14 @@ const (
 	bandwidthsLen       = 100
 	mezzanineDecodePath = "/tmp/mezzanine.yuv"
 	distortedDecodePath = "/tmp/distorted.yuv"
+	logsDir             = "logs"
 	minVmafResolution   = 192
 )
 
 var (
 	subsample = flag.Int("subsample", 5, "What vmaf subsampling factor to use")
 	threads   = flag.Int("threads", 5, "How many threads used to run vmaf")
-	model     = flag.String("model", "vmaf_v0.6.1.pkl", "vmaf model to use")
+	model     = flag.String("model", "model/vmaf_v0.6.1.pkl", "vmaf model to use")
 	dataFile  = flag.String("datafile", "data.json", "Location of the data file to use for processing")
 )
 
@@ -48,12 +50,49 @@ type DataFile struct {
 
 type FFProbeOutput struct {
 	Streams []*FFProbeStream `json:"streams"`
+	Frames  []*FFProbeFrame  `json:"frames"`
 }
 
 type FFProbeStream struct {
 	Width    uint64 `json:"width"`
 	Height   uint64 `json:"height"`
 	NbFrames uint64 `json:"nb_frames,string"`
+}
+
+type FFProbeFrame struct {
+	PktPts int64 `json:"pkt_pts"`
+}
+
+type VMAFLog struct {
+	Version string
+	Params  *VMAFParams
+	Metrics []string
+	Frames  []*VMAFFrame `json:"frames"`
+}
+
+type VMAFParams struct {
+	Model        string
+	ScaledWidth  int `json:"scaledWidth"`
+	ScaledHeight int `json:"scaledHeight"`
+	Subsample    int
+}
+
+type VMAFFrame struct {
+	FrameNum int `json:"frameNum"`
+	Metrics  *VMAFMetrics
+}
+
+type VMAFMetrics struct {
+	Adm2      float64 `json:"adm2"`
+	Motion2   float64 `json:"motion2"`
+	MsSsim    float64 `json:"ms_ssim"`
+	Psnr      float64 `json:"psnr"`
+	Ssim      float64 `json:"ssim"`
+	VifScale0 float64 `json:"vif_scale0"`
+	VifScale1 float64 `json:"vif_scale1"`
+	VifScale2 float64 `json:"vif_scale2"`
+	VifScale3 float64 `json:"vif_scale3"`
+	VMAF      float64 `json:"vmaf"`
 }
 
 func sumFloat64Array(in []float64) float64 {
@@ -65,7 +104,7 @@ func sumFloat64Array(in []float64) float64 {
 }
 
 func probeFile(filename string) (*FFProbeOutput, error) {
-	probecmd := exec.Command("ffprobe", "-print_format", "json", "-show_streams", "-select_streams", "v:0", filename)
+	probecmd := exec.Command("ffprobe", "-print_format", "json", "-show_streams", "-show_frames", "-select_streams", "v:0", filename)
 	stdoutData, err := probecmd.Output()
 	fmt.Printf("Probe output: %s\n", string(stdoutData))
 	if err != nil {
@@ -81,6 +120,7 @@ func probeFile(filename string) (*FFProbeOutput, error) {
 		fmt.Printf("Failed to unmarshal probe response: '%v'\n", err)
 		return nil, fmt.Errorf("Failed to unmarshal probe response: '%v'", err)
 	}
+
 	return &probe, nil
 }
 
@@ -117,9 +157,53 @@ func decodeToWidthAndHeight(ctx context.Context, inputFile, outputFile string, w
 	return nil
 }
 
-func calculateVmaf(ctx context.Context, mezzaninePath, distortedPath string, width, height uint64) (float64, error) {
-	// TODO: /home/nick/public_src/vmaf/wrapper/vmafossexec yuv420p 352 198 /tmp/mezzanine.yuv /tmp/distorted.yuv /home/nick/public_src/vmaf/model/vmaf_v0.6.1.pkl --log whut.log --log-fmt json --thread 8 --pool harmonic_mean --psnr --ssim --ms-ssim
-	return 0, nil
+func calculateVmaf(ctx context.Context, mezzaninePath, distortedPath string, variant, width, height uint64) (float64, error) {
+	logsFile := fmt.Sprintf("%s/%d_%d_%d.log", logsDir, variant, width, height)
+	vmafCmd := exec.CommandContext(ctx,
+		"vmafossexec",
+		"yuv420p",
+		fmt.Sprintf("%d", width),
+		fmt.Sprintf("%d", height),
+		mezzanineDecodePath,
+		distortedDecodePath,
+		*model,
+		"--log", logsFile,
+		"--log-fmt", "json",
+		"--thread", fmt.Sprintf("%d", *threads),
+		"--pool", "harmonic_mean",
+		"--psnr",
+		"--ssim",
+		"--ms-ssim")
+
+	stdoutData, err := vmafCmd.Output()
+	if err != nil {
+		fmt.Printf("VMAF output:\n%s\n", string(stdoutData))
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return 0, fmt.Errorf("Error running VMAF: %s", exitErr.Stderr)
+		}
+		return 0, fmt.Errorf("Unexpected error running vmaf: %v", err)
+	}
+
+	vmafRawOutput, err := ioutil.ReadFile(logsFile)
+	if err != nil {
+		fmt.Printf("Failed to read VMAF logs output: %v\n", err)
+		return 0, err
+	}
+
+	var vmafResult VMAFLog
+	if err := json.Unmarshal(vmafRawOutput, &vmafResult); err != nil {
+		fmt.Printf("Failed to unmarshal vmaf logs: %v\n", err)
+		return 0, err
+	}
+
+	vmafScores := make([]float64, len(vmafResult.Frames))
+	for i, frame := range vmafResult.Frames {
+		vmafScores[i] = frame.Metrics.VMAF
+	}
+
+	vmafHarmonicMean := stat.HarmonicMean(vmafScores, nil)
+
+	return vmafHarmonicMean, nil
 }
 
 func main() {
@@ -186,7 +270,7 @@ func main() {
 	for i, variant := range sortedVariants {
 		fmt.Printf("Here's a variant: %v\n", variant)
 
-		if variantInfo[i], err = DumpStream(variant.URI, fmt.Sprintf("variant_%d.mp4", i)); err != nil {
+		if variantInfo[i], err = DumpStream(variant.URI, fmt.Sprintf("variant_%d.ts", i)); err != nil {
 			fmt.Printf("Failed to dump stream: %v\n", err)
 			return
 		}
@@ -196,7 +280,7 @@ func main() {
 			return
 		}
 
-		if variantInfo[i].Streams[0].NbFrames != videoStream.NbFrames {
+		if len(variantInfo[i].Frames) != len(mezzanineInfo.Frames) {
 			fmt.Printf("Variant frame count doesn't match mezzanine frame count: %d != %d\n", variantInfo[i].Streams[0].NbFrames, videoStream.NbFrames)
 			return
 		}
@@ -257,6 +341,7 @@ func main() {
 
 	syscall.Mkfifo(mezzanineDecodePath, 0600)
 	syscall.Mkfifo(distortedDecodePath, 0600)
+	os.MkdirAll(logsDir, 0700)
 
 	effectiveVmafs := make([][]float64, len(sortedVariants))
 	for i := range sortedVariants {
@@ -286,16 +371,25 @@ func main() {
 
 			wg.Add(1)
 			go func() {
-				if err := decodeToWidthAndHeight(ctx, fmt.Sprintf("variant_%d.mp4", i), distortedDecodePath, curWidth, curHeight); err != nil {
+				if err := decodeToWidthAndHeight(ctx, fmt.Sprintf("variant_%d.ts", i), distortedDecodePath, curWidth, curHeight); err != nil {
 					fmt.Printf("Error encountered decoding variant:\n%v\n", err)
 					errc <- err
 				}
 				wg.Done()
 			}()
 
+			var vmafScore float64
 			wg.Add(1)
 			go func() {
-				// calculateVmaf()
+				var vmafErr error
+				vmafScore, vmafErr = calculateVmaf(ctx, mezzanineDecodePath, distortedDecodePath, uint64(i), curWidth, curHeight)
+				if vmafErr != nil {
+					fmt.Printf("Error encountered calculating vmaf:\n%v\n", vmafErr)
+					errc <- err
+				} else {
+					fmt.Printf("I calculated vmaf and got this harmonic mean: %f\n", vmafScore)
+				}
+
 				wg.Done()
 			}()
 
@@ -307,7 +401,7 @@ func main() {
 			hadErr := false
 			select {
 			case err = <-errc:
-				if !hadErr {
+				if err != nil && !hadErr {
 					hadErr = true
 					cancelFunc()
 				}
@@ -319,6 +413,7 @@ func main() {
 			}
 
 			fmt.Println("Oh yeah decode done\n")
+			return
 		}
 	}
 
