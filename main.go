@@ -1,17 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
+	"sync"
+	"syscall"
 
 	"github.com/grafov/m3u8"
+)
+
+const (
+	resolutionsLen      = 120
+	bandwidthsLen       = 100
+	mezzanineDecodePath = "/tmp/mezzanine.yuv"
+	distortedDecodePath = "/tmp/distorted.yuv"
+	minVmafResolution   = 192
 )
 
 var (
@@ -41,12 +51,10 @@ type FFProbeOutput struct {
 }
 
 type FFProbeStream struct {
-	Width  uint64 `json:"width"`
-	Height uint64 `json:"height"`
+	Width    uint64 `json:"width"`
+	Height   uint64 `json:"height"`
+	NbFrames uint64 `json:"nb_frames,string"`
 }
-
-const resolutionsLen = 120
-const bandwidthsLen = 100
 
 func sumFloat64Array(in []float64) float64 {
 	result := float64(0.0)
@@ -76,10 +84,42 @@ func probeFile(filename string) (*FFProbeOutput, error) {
 	return &probe, nil
 }
 
+func DumpStream(variantUrl string, outputName string) (*FFProbeOutput, error) {
+	dumpCmd := exec.Command("ffmpeg", "-y", "-i", variantUrl, "-c", "copy", outputName)
+	stdoutData, err := dumpCmd.Output()
+	fmt.Printf("Dump output: %s\n", string(stdoutData))
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("Error running ffmpeg dump: %s", exitErr.Stderr)
+		}
+		return nil, fmt.Errorf("Unexpected error running ffmpeg dump: %v", err)
+	}
+
+	return probeFile(outputName)
+}
+
 func WidthToHeight(width, mezzanineWidth, mezzanineHeight uint64) uint64 {
-	scalingFactor := float64(mezzanineWidth) / float64(mezzanineHeight)
-	height := math.RoundToEven(scalingFactor * float64(width))
-	return uint64(height)
+	scalingFactor := float64(mezzanineHeight) / float64(mezzanineWidth)
+	height := uint64(scalingFactor*float64(width)) >> 1 << 1
+	return height
+}
+
+func decodeToWidthAndHeight(ctx context.Context, inputFile, outputFile string, width, height uint64) error {
+	decodeCmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputFile, "-vf", fmt.Sprintf("scale=%d:%d", width, height), "-pix_fmt", "yuv420p", outputFile)
+	stdoutData, err := decodeCmd.Output()
+	if err != nil {
+		fmt.Printf("Decode output: %s\n", string(stdoutData))
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("Error running ffmpeg decode: %s", exitErr.Stderr)
+		}
+		return fmt.Errorf("Unexpected error running ffmpeg decode: %v", err)
+	}
+	return nil
+}
+
+func calculateVmaf(ctx context.Context, mezzaninePath, distortedPath string, width, height uint64) (float64, error) {
+	// TODO: /home/nick/public_src/vmaf/wrapper/vmafossexec yuv420p 352 198 /tmp/mezzanine.yuv /tmp/distorted.yuv /home/nick/public_src/vmaf/model/vmaf_v0.6.1.pkl --log whut.log --log-fmt json --thread 8 --pool harmonic_mean --psnr --ssim --ms-ssim
+	return 0, nil
 }
 
 func main() {
@@ -93,7 +133,25 @@ func main() {
 	mezzanineFile := flag.Args()[0]
 	manifestURL := flag.Args()[1]
 
-	// Parse the viewer data
+	// Probe the input file
+	mezzanineInfo, err := probeFile(mezzanineFile)
+	if err != nil {
+		fmt.Printf("Failed to probe file: %v\n", err)
+		return
+	}
+
+	if len(mezzanineInfo.Streams) != 1 {
+		fmt.Printf("Input file must have exactly 1 video stream, but had %d streams\n", len(mezzanineInfo.Streams))
+		return
+	}
+
+	videoStream := mezzanineInfo.Streams[0]
+	if videoStream.Width == 0 || videoStream.Height == 0 {
+		fmt.Printf("Input file must have a valid width and height, but has %dx%d", videoStream.Width, videoStream.Height)
+		return
+	}
+
+	fmt.Printf("Input widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
 
 	// Load the master manfest
 	resp, err := http.Get(manifestURL)
@@ -124,8 +182,26 @@ func main() {
 	sortedVariants := masterPlaylist.Variants
 	sort.Sort(ByBandwidth(masterPlaylist.Variants))
 
-	for _, variant := range sortedVariants {
+	variantInfo := make([]*FFProbeOutput, len(sortedVariants))
+	for i, variant := range sortedVariants {
 		fmt.Printf("Here's a variant: %v\n", variant)
+
+		if variantInfo[i], err = DumpStream(variant.URI, fmt.Sprintf("variant_%d.mp4", i)); err != nil {
+			fmt.Printf("Failed to dump stream: %v\n", err)
+			return
+		}
+
+		if len(variantInfo[i].Streams) != 1 {
+			fmt.Printf("Invalid variant stream has no video track\n")
+			return
+		}
+
+		if variantInfo[i].Streams[0].NbFrames != videoStream.NbFrames {
+			fmt.Printf("Variant frame count doesn't match mezzanine frame count: %d != %d\n", variantInfo[i].Streams[0].NbFrames, videoStream.NbFrames)
+			return
+		}
+
+		fmt.Printf("Variant info looks good: %d\n", i)
 	}
 
 	fmt.Printf("Input has %d variants\n", len(sortedVariants))
@@ -157,25 +233,6 @@ func main() {
 	fmt.Printf("Bandwidths len: %d sum: %f\n", len(data.BandwidthPcts), sumFloat64Array(data.BandwidthPcts))
 	fmt.Printf("Resolutions len: %d sum: %f\n", len(data.ResolutionPcts), sumFloat64Array(data.ResolutionPcts))
 
-	fileInfo, err := probeFile(mezzanineFile)
-	if err != nil {
-		fmt.Printf("Failed to probe file: %v\n", err)
-		return
-	}
-
-	if len(fileInfo.Streams) != 1 {
-		fmt.Printf("Input file must have exactly 1 video stream, but had %d streams\n", len(fileInfo.Streams))
-		return
-	}
-
-	videoStream := fileInfo.Streams[0]
-	if videoStream.Width == 0 || videoStream.Height == 0 {
-		fmt.Printf("Input file must have a valid width and height, but has %dx%d", videoStream.Width, videoStream.Height)
-		return
-	}
-
-	fmt.Printf("Input widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
-
 	userPcts := make([]float64, len(sortedVariants)+1)
 
 	curVariant := 0
@@ -196,13 +253,72 @@ func main() {
 		fmt.Printf("%0.3f of users have sufficient bandwidth for rendition %d\n", totalPct, i)
 	}
 
+	fmt.Printf("Preparing for VMAF\n")
+
+	syscall.Mkfifo(mezzanineDecodePath, 0600)
+	syscall.Mkfifo(distortedDecodePath, 0600)
+
 	effectiveVmafs := make([][]float64, len(sortedVariants))
 	for i := range sortedVariants {
 		effectiveVmafs[i] = make([]float64, len(data.ResolutionPcts))
-		for j, userPct := range data.ResolutionPcts {
-			fmt.Printf("Calculating VMAF score for variant %d, resolution %d\n", i, (j+1)*16)
+		for j, _ := range data.ResolutionPcts {
+			ctx, cancelFunc := context.WithCancel(context.Background())
+			curWidth := uint64((j + 1) * 16)
+			curHeight := WidthToHeight(curWidth, videoStream.Width, videoStream.Height)
 
-			fmt.Printf("%f of users have this resolution\n", userPct)
+			if curWidth < minVmafResolution || curHeight < minVmafResolution {
+				fmt.Printf("Skipping resolution %dx%d - its too small for VMAF\n", curWidth, curHeight)
+				continue
+			}
+
+			fmt.Printf("Calculating VMAF score at %dx%d\n", curWidth, curHeight)
+
+			var wg sync.WaitGroup
+			errc := make(chan error, 1)
+			wg.Add(1)
+			go func() {
+				if err := decodeToWidthAndHeight(ctx, mezzanineFile, mezzanineDecodePath, curWidth, curHeight); err != nil {
+					fmt.Printf("Error encountered decoding mezzanine:\n%v\n", err)
+					errc <- err
+				}
+				wg.Done()
+			}()
+
+			wg.Add(1)
+			go func() {
+				if err := decodeToWidthAndHeight(ctx, fmt.Sprintf("variant_%d.mp4", i), distortedDecodePath, curWidth, curHeight); err != nil {
+					fmt.Printf("Error encountered decoding variant:\n%v\n", err)
+					errc <- err
+				}
+				wg.Done()
+			}()
+
+			wg.Add(1)
+			go func() {
+				// calculateVmaf()
+				wg.Done()
+			}()
+
+			go func() {
+				wg.Wait()
+				close(errc)
+			}()
+
+			hadErr := false
+			select {
+			case err = <-errc:
+				if !hadErr {
+					hadErr = true
+					cancelFunc()
+				}
+			}
+
+			if hadErr {
+				fmt.Printf("Error running vmaf calculation, goodbye\n")
+				return
+			}
+
+			fmt.Println("Oh yeah decode done\n")
 		}
 	}
 
