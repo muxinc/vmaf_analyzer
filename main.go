@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 
 	"github.com/grafov/m3u8"
 )
@@ -18,6 +20,13 @@ var (
 	model     = flag.String("model", "vmaf_v0.6.1.pkl", "vmaf model to use")
 	dataFile  = flag.String("datafile", "data.json", "Location of the data file to use for processing")
 )
+
+// ByBandwidth implements sort.Interface for []*m3u8.Variant based on the Bandwidth field.
+type ByBandwidth []*m3u8.Variant
+
+func (v ByBandwidth) Len() int           { return len(v) }
+func (v ByBandwidth) Swap(i, j int)      { v[i], v[j] = v[j], v[i] }
+func (v ByBandwidth) Less(i, j int) bool { return v[i].Bandwidth < v[j].Bandwidth }
 
 // DataFile represents the current environment data
 // Resolutions are represented by *widths* in 16-pixel buckets
@@ -68,7 +77,9 @@ func probeFile(filename string) (*FFProbeOutput, error) {
 }
 
 func WidthToHeight(width, mezzanineWidth, mezzanineHeight uint64) uint64 {
-	return 0
+	scalingFactor := float64(mezzanineWidth) / float64(mezzanineHeight)
+	height := math.RoundToEven(scalingFactor * float64(width))
+	return uint64(height)
 }
 
 func main() {
@@ -110,11 +121,14 @@ func main() {
 	fmt.Printf("Master Playlist: %+v\n", masterPlaylist)
 	fmt.Printf("Loading mezzanine: %s\n", mezzanineFile)
 
-	for _, variant := range masterPlaylist.Variants {
+	sortedVariants := masterPlaylist.Variants
+	sort.Sort(ByBandwidth(masterPlaylist.Variants))
+
+	for _, variant := range sortedVariants {
 		fmt.Printf("Here's a variant: %v\n", variant)
 	}
 
-	fmt.Printf("Input has %d variants\n", len(masterPlaylist.Variants))
+	fmt.Printf("Input has %d variants\n", len(sortedVariants))
 
 	fileReader, err := os.Open(*dataFile)
 	if err != nil {
@@ -162,14 +176,35 @@ func main() {
 
 	fmt.Printf("Input widthxheight: %dx%d\n", videoStream.Width, videoStream.Height)
 
-	// Parse bitrate & resolution combinations
+	userPcts := make([]float64, len(sortedVariants)+1)
 
-	// For each rendition
-	// Load the renditions, and download all renditions to local ts streams
+	curVariant := 0
+	for i, userPct := range data.BandwidthPcts {
+		if curVariant == len(sortedVariants) {
+			userPcts[curVariant] += userPct
+			continue
+		}
 
-	// For each rendition
-	// For each resolution bucket with > 0 viewers
-	// Calculate VMAF
+		if uint32(i*100*1000) >= sortedVariants[curVariant].Bandwidth {
+			curVariant++
+		}
+
+		userPcts[curVariant] += userPct
+	}
+
+	for i, totalPct := range userPcts {
+		fmt.Printf("%0.3f of users have sufficient bandwidth for rendition %d\n", totalPct, i)
+	}
+
+	effectiveVmafs := make([][]float64, len(sortedVariants))
+	for i := range sortedVariants {
+		effectiveVmafs[i] = make([]float64, len(data.ResolutionPcts))
+		for j, userPct := range data.ResolutionPcts {
+			fmt.Printf("Calculating VMAF score for variant %d, resolution %d\n", i, (j+1)*16)
+
+			fmt.Printf("%f of users have this resolution\n", userPct)
+		}
+	}
 
 	fmt.Println("Done")
 }
