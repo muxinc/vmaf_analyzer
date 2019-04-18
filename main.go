@@ -24,12 +24,12 @@ const (
 	distortedDecodePath = "/tmp/distorted.yuv"
 	logsDir             = "logs"
 	minVmafResolution   = 192
-	lowVMAFThreshold    = 5.0
+	lowVMAFThreshold    = 0.0
 )
 
 var (
-	subsample = flag.Int("subsample", 5, "What vmaf subsampling factor to use")
-	threads   = flag.Int("threads", 5, "How many threads used to run vmaf")
+	subsample = flag.Int("subsample", 30, "What vmaf subsampling factor to use")
+	threads   = flag.Int("threads", 10, "How many threads used to run vmaf")
 	model     = flag.String("model", "model/vmaf_v0.6.1.pkl", "vmaf model to use")
 	dataFile  = flag.String("datafile", "data.json", "Location of the data file to use for processing")
 )
@@ -146,6 +146,7 @@ func WidthToHeight(width, mezzanineWidth, mezzanineHeight uint64) uint64 {
 }
 
 func decodeToWidthAndHeight(ctx context.Context, inputFile, outputFile string, width, height uint64) error {
+	fmt.Printf("Decoding this input: %s\n", inputFile)
 	decodeCmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputFile, "-vf", fmt.Sprintf("scale=%d:%d", width, height), "-pix_fmt", "yuv420p", outputFile)
 	stdoutData, err := decodeCmd.Output()
 	if err != nil {
@@ -194,6 +195,8 @@ func calculateVmaf(ctx context.Context, mezzaninePath, distortedPath string, var
 	var vmafResult VMAFLog
 	if err := json.Unmarshal(vmafRawOutput, &vmafResult); err != nil {
 		fmt.Printf("Failed to unmarshal vmaf logs: %v\n", err)
+		fmt.Printf("This is vmaf stdout: %s\n", stdoutData)
+		fmt.Printf("This is the log: %s\n", vmafRawOutput)
 		return 0, err
 	}
 
@@ -346,8 +349,8 @@ func main() {
 	syscall.Mkfifo(distortedDecodePath, 0600)
 	os.MkdirAll(logsDir, 0700)
 
-	effectiveVmafs := make([][]float64, len(sortedVariants))
-	for i := range sortedVariants {
+	effectiveVmafs := make([][]float64, len(userPcts))
+	for i := range userPcts {
 		effectiveVmafs[i] = make([]float64, len(data.ResolutionPcts))
 		if i == 0 {
 			continue
@@ -363,7 +366,8 @@ func main() {
 				continue
 			}
 			if resUserPct == 0.0 {
-				fmt.Printf("Skipping resolution %dx%d - zero percentage of users watch at this resolution", curWidth, curHeight)
+				fmt.Printf("Skipping resolution %dx%d - zero percentage of users watch at this resolution\n", curWidth, curHeight)
+				continue
 			}
 
 			fmt.Printf("Calculating VMAF score at %dx%d\n", curWidth, curHeight)
@@ -381,7 +385,7 @@ func main() {
 
 			wg.Add(1)
 			go func() {
-				if err := decodeToWidthAndHeight(ctx, fmt.Sprintf("variant_%d.ts", i), distortedDecodePath, curWidth, curHeight); err != nil {
+				if err := decodeToWidthAndHeight(ctx, fmt.Sprintf("variant_%d.ts", i-1), distortedDecodePath, curWidth, curHeight); err != nil {
 					fmt.Printf("Error encountered decoding variant:\n%v\n", err)
 					errc <- err
 				}
@@ -392,7 +396,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				var vmafErr error
-				vmafScore, vmafErr = calculateVmaf(ctx, mezzanineDecodePath, distortedDecodePath, uint64(i), curWidth, curHeight)
+				vmafScore, vmafErr = calculateVmaf(ctx, mezzanineDecodePath, distortedDecodePath, uint64(i-1), curWidth, curHeight)
 				if vmafErr != nil {
 					fmt.Printf("Error encountered calculating vmaf:\n%v\n", vmafErr)
 					errc <- err
@@ -411,8 +415,7 @@ func main() {
 			}()
 
 			hadErr := false
-			select {
-			case err = <-errc:
+			for err := range errc {
 				if err != nil && !hadErr {
 					hadErr = true
 					cancelFunc()
