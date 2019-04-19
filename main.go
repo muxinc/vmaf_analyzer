@@ -285,7 +285,7 @@ func main() {
 		}
 
 		if len(variantInfo[i].Frames) != len(mezzanineInfo.Frames) {
-			fmt.Printf("Variant frame count doesn't match mezzanine frame count: %d != %d\n", variantInfo[i].Streams[0].NbFrames, videoStream.NbFrames)
+			fmt.Printf("Variant frame count doesn't match mezzanine frame count: %d != %d\n", len(variantInfo[i].Frames), len(mezzanineInfo.Frames))
 			return
 		}
 
