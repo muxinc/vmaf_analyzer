@@ -28,7 +28,7 @@ const (
 var (
 	subsample = flag.Int("subsample", 30, "What vmaf subsampling factor to use")
 	threads   = flag.Int("threads", 10, "How many threads used to run vmaf")
-	model     = flag.String("model", "model/vmaf_v0.6.1.pkl", "vmaf model to use")
+	model     = flag.String("model", "vmaf/model/vmaf_v0.6.1.pkl", "vmaf model to use")
 	dataFile  = flag.String("datafile", "data.json", "Location of the data file to use for processing")
 )
 
