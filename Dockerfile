@@ -37,5 +37,4 @@ RUN cd $SRC_DIR && \
     go get -u github.com/golang/dep/cmd/dep && \
     rm -rf vendor && dep ensure && \
     go build && \
-    cp vmaf_analyzer /vmaf_analyzer && \
-    cp example/data.json /data.json
+    cp vmaf_analyzer /vmaf_analyzer

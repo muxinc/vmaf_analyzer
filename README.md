@@ -70,10 +70,10 @@ docker build -t muxinc/vmaf_analyzer .
 
 Map a local directory containing the `mezzanine.mp4` file and run the docker container:
 ```
-docker run -it --rm \
+docker run --rm \
     --volume $(pwd)/videos:/videos \
     --volume $(pwd)/data:/data \
-    muxinc/vmaf_analyzer bash ./vmaf_analyzer --datafile=/data/data.json /videos/mezzanine.mp4 https://stream.mux.com/pnQZ4GRsFpAljZEf4EmFEwjlpe5sV4lu.m3u8
+    muxinc/vmaf_analyzer:latest ./vmaf_analyzer --datafile=/data/data.json /videos/mux-video-intro.mp4 https://stream.mux.com/pnQZ4GRsFpAljZEf4EmFEwjlpe5sV4lu.m3u8
 ```
 
 Viewer Information
