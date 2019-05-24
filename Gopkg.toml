@@ -1,0 +1,17 @@
+# Gopkg.toml
+#
+# Refer to https://golang.github.io/dep/docs/Gopkg.toml.html
+# for detailed Gopkg.toml documentation.
+
+required = [
+    "github.com/grafov/m3u8",
+    "gonum.org/v1/gonum",
+]
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/grafov/m3u8"
+
+[[constraint]]
+  branch = "master"
+  name = "gonum.org/v1/gonum"
