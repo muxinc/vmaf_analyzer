@@ -1,5 +1,6 @@
 FROM ubuntu:16.04
 MAINTAINER Mux Inc "info@mux.com"
+# ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update
 RUN apt-get install -y curl software-properties-common build-essential git
@@ -8,12 +9,17 @@ RUN rm -rf /var/lib/apt/lists/*
 # install FFMPEG
 RUN apt-get update && apt-get install -y ffmpeg
 
-# install VMAF
-RUN apt-get install -y python python-setuptools python-dev python-tk python-pip
+# install VMAF`
+RUN apt-get install -y python python-setuptools python-dev python-tk python-pip ninja-build python3 python3-dev python3-pip python3-setuptools python3-tk
 RUN pip install --upgrade pip
 RUN pip install numpy scipy matplotlib notebook pandas sympy nose scikit-learn scikit-image h5py sureal
-RUN git clone --depth 1 https://github.com/Netflix/vmaf.git vmaf
+# RUN pip3 install meson
+# RUN git clone https://github.com/Netflix/vmaf.git vmaf
+RUN curl -sLO https://github.com/Netflix/vmaf/archive/v1.3.9.tar.gz && \
+      tar xvzf v1.3.9.tar.gz && \
+      mv vmaf-1.3.9 vmaf
 WORKDIR vmaf/
+# RUN git checkout 079ebdd9faaeca45b9fcef887482aacbaedc853b
 ENV PYTHONPATH=/vmaf/python/src:/vmaf:$PYTHONPATH
 ENV PATH=/vmaf:/vmaf/wrapper:$PATH
 RUN make
